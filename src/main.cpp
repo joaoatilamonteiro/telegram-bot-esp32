@@ -35,23 +35,27 @@ void gerencia_mensagem(int numero_mensagens){
       continue;
     }
 
-    if (texto == "/start"){
-      String hello_world = "Olá " + nome_remetente + "\n";
+    if (texto == "start"){
+      String hello_world = "Olá " + nome_remetente + "\n"
+      "🤖 *Painel de Controle*\n\n";
+      hello_world += "🟢 ligar computador\n";
+      hello_world += "🔴 desligar computador\n";
+      hello_world += "🔍 status\n";
+
       bot.sendMessage(chatID, hello_world, "");
     }
 
-    else if (texto.indexOf("desligar") != -1 && texto.indexOf("led") != -1){
-      digitalWrite(pino_led, LOW);
-      bot.sendMessage(chatID, "comando recebido!\nDesligando o led","");
+    else if (texto.indexOf("status") != -1){
+          // Se a ESP32 tem um IP salvo, é porque a porta 5000 está viva
+          if (ip_pc[0] != 0) {
+            bot.sendMessage(chatID, "Computador ligado!\nIP: " + ip_pc.toString(), "");
+          } else {
+            bot.sendMessage(chatID, "Sem resposta do computador", "");
+          }
     }
 
-    else if (texto.indexOf("ligar") != -1 && texto.indexOf("led") != -1){
-      digitalWrite(pino_led, HIGH);
-      bot.sendMessage(chatID, "comando recebido!\nLigando o led","");
-    }
 
     else if (texto.indexOf("desligar") != -1 && texto.indexOf("computador") != -1){
-      digitalWrite(pino_led, LOW);
       bot.sendMessage(chatID, "Procurando o computador na rede...", "");
 
       // Fase 1: "voce esta aqui?" em binario
@@ -146,8 +150,6 @@ void gerencia_mensagem(int numero_mensagens){
       }
     }
     else if (texto.indexOf("ligar") != -1 && texto.indexOf("computador") != -1){
-      digitalWrite(pino_led, HIGH);
-
       bot.sendMessage(chatID, "Comando recebido!\nLigando o computador", "");
 
       byte packet_magic[102];
