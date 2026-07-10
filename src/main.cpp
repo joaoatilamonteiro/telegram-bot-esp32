@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <WiFiUdp.h>
 #include "secrets.h" 
+#include <ESP32Ping.h>
 
 WiFiClientSecure client;
 WiFiClient tcpClient;
@@ -17,6 +18,26 @@ const int pino_led = 2;
 
 unsigned long tuv = 0; 
 const unsigned long intervalo_varredura = 5000;
+
+void liga_pc_wol(){
+    byte packet_magic[102];
+    for (int i = 0; i< 6; i++){
+      packet_magic[i] = 0xFF;
+    }
+
+    int indice_pacote = 6;
+
+    for (int i = 0; i<16; i++){
+      for (int a = 0; a < 6; a++){
+        packet_magic[indice_pacote] = MAC_ALVO[a];
+        indice_pacote++;
+      }
+    }
+
+    udp.beginPacket("255.255.255.255",9);
+    udp.write(packet_magic,102);
+    udp.endPacket();
+}
 
 void gerencia_mensagem(int numero_mensagens){
   Serial.print("Carregando...");
@@ -152,23 +173,7 @@ void gerencia_mensagem(int numero_mensagens){
     else if (texto.indexOf("ligar") != -1 && texto.indexOf("computador") != -1){
       bot.sendMessage(chatID, "Comando recebido!\nLigando o computador", "");
 
-      byte packet_magic[102];
-      for (int i = 0; i< 6; i++){
-        packet_magic[i] = 0xFF;
-      }
-
-      int indice_pacote = 6;
-
-      for (int i = 0; i<16; i++){
-        for (int a = 0; a < 6; a++){
-          packet_magic[indice_pacote] = MAC_ALVO[a];
-          indice_pacote++;
-        }
-      }
-
-      udp.beginPacket("255.255.255.255",9);
-      udp.write(packet_magic,102);
-      udp.endPacket();
+      liga_pc_wol();
 
       delay(2000); 
 
@@ -199,6 +204,7 @@ void setup() {
   Serial.println("Endereço IP: " + WiFi.localIP().toString());
 
   client.setInsecure();
+  ultimo_momento_visto = millis();
 }
 
 void loop() {
@@ -254,7 +260,6 @@ void loop() {
   int conta_nova_mensagem = bot.getUpdates(bot.last_message_received + 1);
   
   while (conta_nova_mensagem) {
-    Serial.println("Mensagem recebida no telegram!");
     gerencia_mensagem(conta_nova_mensagem);
     conta_nova_mensagem = bot.getUpdates(bot.last_message_received + 1);    
   }
