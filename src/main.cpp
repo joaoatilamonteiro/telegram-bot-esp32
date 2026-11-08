@@ -7,11 +7,15 @@
 #include "secrets.h" 
 #include <ESP32Ping.h>
 
+extern void csiSetup();
+extern void csiLoop();
+
 WiFiClientSecure client;
 WiFiClient tcpClient;
 WiFiUDP udp;
 
 UniversalTelegramBot bot(BOT_TOKEN, client);
+unsigned long ultimo_momento_visto = 0;
 
 IPAddress ip_pc(0, 0, 0, 0);
 const int pino_led = 2;
@@ -57,13 +61,24 @@ void gerencia_mensagem(int numero_mensagens){
     }
 
     if (texto == "start"){
-      String hello_world = "Olá " + nome_remetente + "\n"
-      "🤖 *Painel de Controle*\n\n";
+      String hello_world = "Olá " + nome_remetente + "\n";
       hello_world += "🟢 ligar computador\n";
       hello_world += "🔴 desligar computador\n";
       hello_world += "🔍 status\n";
+      hello_world += "🛡️ ativar radar\n";
+      hello_world += "🛌 desativar radar\n";
 
       bot.sendMessage(chatID, hello_world, "");
+    }
+
+    else if (texto.indexOf("ativar radar") != -1){
+      bot.sendMessage(chatID, "🛡️ Radar ARMADO! Avisarei sobre movimentos.", "");
+      Serial.println("[CMD:ALARME_ON]"); // O Python vai ler isso
+    }
+
+    else if (texto.indexOf("desativar radar") != -1){
+      bot.sendMessage(chatID, "🛌 Radar DESARMADO. Sistema em modo silencioso.", "");
+      Serial.println("[CMD:ALARME_OFF]"); // O Python vai ler isso
     }
 
     else if (texto.indexOf("status") != -1){
@@ -183,12 +198,24 @@ void gerencia_mensagem(int numero_mensagens){
   }
 }
 
+void tarefaRadar(void *pvParameters){
+  for(;;){
+    csiLoop();
+    vTaskDelay(1/portTICK_PERIOD_MS); //atraso de 1ms obrigatorio para evitar que o watchdog timer
+                                    //da esp reinicie por achar que a placa travou
+  }
+}
+
 void setup() {
   pinMode(pino_led, OUTPUT);
   digitalWrite(pino_led, LOW);
-  Serial.begin(115200);
-  Serial.println();
-  Serial.println("Iniciando o sistema");
+
+  Serial.begin(921600);
+  while (!Serial) {
+    delay(10);
+  }
+
+  Serial.println("Iniciando o sistema (bot com radar)");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -205,6 +232,18 @@ void setup() {
 
   client.setInsecure();
   ultimo_momento_visto = millis();
+
+  csiSetup();
+  // tarefa isolada para o nucleo 0
+  xTaskCreatePinnedToCore(
+    tarefaRadar,
+    "TaskRadar",
+    10000,
+    NULL,
+    1,
+    NULL,
+    0
+  );
 }
 
 void loop() {
@@ -263,5 +302,4 @@ void loop() {
     gerencia_mensagem(conta_nova_mensagem);
     conta_nova_mensagem = bot.getUpdates(bot.last_message_received + 1);    
   }
-
 }

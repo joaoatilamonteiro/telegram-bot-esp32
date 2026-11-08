@@ -1,76 +1,71 @@
-# Telegram Bot ESP32 - Controle e Monitoramento de PC
 
-Este projeto utiliza um microcontrolador **ESP32** integrado à API do Telegram para ligar, desligar e monitorar remotamente o status de um computador na rede local.
+# Telegram Bot ESP32 + Radar Wi-Fi (CSI)
+
+Este projeto transforma um ESP32 em um assistente residencial versátil controlado via Telegram. Ele atua como uma ponte para controlar o seu computador pela rede local e também funciona simultaneamente como um **radar de movimento invisível**, utilizando a distorção do sinal Wi-Fi (CSI) para detectar presença no ambiente e enviar alertas.
 
 ## Funcionalidades
-* **Ligar Computador (Wake-on-LAN):** Envia um "Magic Packet" para ligar a máquina através do MAC Address.
-* **Desligar Computador:** Comunicação via UDP com um script Python rodando no PC para executar o desligamento seguro.
-* **Rastreamento Automático de IP:** A ESP32 descobre automaticamente o IP do PC na rede através de Broadcast UDP + Validação de MAC Address (dispensando a necessidade de IP Fixo).
-* **Monitoramento por LED (TCP Ping):** A ESP32 verifica a cada 5 segundos se a porta 5000 do PC está aberta. Se o PC estiver ativo, o LED embutido acende. Se desligar, o LED apaga.
-* **Segurança Reforçada:** O Bot só responde a comandos originados do seu `Chat ID` específico.
+
+**Controle do Computador (PC)**
+* `ligar computador`: Envia um pacote mágico (Wake-on-LAN) para ligar o PC remotamente.
+* `desligar computador`: Localiza o PC na rede automaticamente via broadcast UDP, valida o MAC Address e envia o comando fatal para o agente `escuta.py`.
+* `status`: Verifica se o PC está online na rede respondendo na porta 5000.
+
+**Radar CSI (Detecção de Movimento Wi-Fi)**
+* `ativar radar` e `desativar radar`: Armam/desarmam o sistema de segurança via Telegram.
+* **Sem câmeras:** Usa a variação do sinal Wi-Fi (Channel State Information) coletada no núcleo 0 do ESP32 para detectar movimento.
+* **Painel Web Ao Vivo:** Interface local em Python (FastAPI) rodando no PC para visualizar os gráficos do radar, limiares e pacotes por segundo em tempo real.
+* **Alertas Inteligentes:** Notificações instantâneas no Telegram com sistema de *cooldown* (padrão de 5 min) e relatório de picos no período.
 
 ---
 
 ## Como Configurar e Instalar
 
-### 1. Configuração da ESP32 (Ficheiro de Senhas)
-Para proteger os seus dados, as senhas e tokens não ficam no código principal. 
-Crie um ficheiro chamado **`secrets.h`** dentro da pasta `src/` e preencha com os seus dados:
-
+### 1. Configuração do ESP32 (Firmware)
+Crie um arquivo `src/secrets.h` com as suas credenciais:
 ```cpp
-#ifndef SECRETS_H
-#define SECRETS_H
-#include <Arduino.h>
+#define WIFI_SSID "SuaRedeWiFi"
+#define WIFI_PASSWORD "SuaSenha"
+#define BOT_TOKEN "TokenDoSeuBot"
+#define chatID "SeuChatID"
+#define MAC_PC "AA:BB:CC:DD:EE:FF"
 
-const char* const WIFI_SSID = "NOME_DA_SUA_REDE";
-const char* const WIFI_PASSWORD = "SENHA_DA_REDE";
 
-const char* const BOT_TOKEN = "SEU_TOKEN_DO_TELEGRAM"; 
-const String CHAT_ID_PERMITIDO = "SEU_CHAT_ID"; 
+Compile e grave o firmware na placa utilizando o **PlatformIO** (`pio run -t upload`).
+*Nota: A comunicação serial agora roda a **921600 baud**.*
 
-// MAC Address da placa de rede do seu PC
-const uint8_t MAC_ALVO[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+### 2. Configuração no PC (Windows)
 
-#endif
+O projeto exige que alguns scripts rodem no computador para receber os comandos e processar os dados do radar.
 
-```
+**Para o controle do PC (escuta.py):**
+Instale a dependência de rede e inicie o agente (lembre-se de liberar a porta UDP/TCP 5000 no firewall):
 
-*(Nota: O ficheiro `secrets.h` está incluído no `.gitignore` para não ser enviado para o GitHub).*
-
-### 2. Configuração do PC (Script Python)
-
-O computador precisa rodar o script para ouvir os comandos da ESP32.
-
-1. Instale a biblioteca necessária para capturar o MAC:
-```bash
+```powershell
 pip install getmac
+python src/escuta.py
 ```
 
+**Para o Painel do Radar CSI:**
+O radar exige que o PC esteja ligado à ESP32 via USB para processar as ondas e hospedar o servidor web.
+Instale as dependências:
 
-2. Execute o ficheiro `escuta.py` na máquina. Ele abrirá dois ouvintes simultâneos na porta `5000` (UDP para receber comandos, TCP para manter o LED de status atualizado).
-
-### 3. Liberação no Firewall do Windows
-
-Para que a ESP32 consiga verificar se o PC está ligado (ping TCP), você precisa permitir a porta 5000 no Windows Defender.
-Abra o **Prompt de Comando (como Administrador)** e rode:
-
-```cmd
-netsh advfirewall firewall add rule name="Libera TCP 5000 ESP" dir=in action=allow protocol=TCP localport=5000
+```powershell
+pip install numpy pyserial requests fastapi uvicorn joblib scikit-learn
 ```
+
+Inicie o servidor (ajuste as portas e IPs conforme sua rede):
+
+```powershell
+python python/demo_ao_vivo_web.py --ip <IP_DO_ESP32> --serial <SUA_PORTA_COM> --token <TOKEN_DO_BOT> --chat-id <SEU_CHAT_ID> --link http://<IP_DO_PC>:8000 --modelo python/modelo_arvore.joblib
+```
+
+Acesse o painel pelo navegador do PC ou celular na mesma rede: `http://<IP_DO_PC>:8000`.
 
 ---
 
-## Comandos Disponíveis no Telegram
+## Limitações Conhecidas
 
-| Comando | Ação |
-| --- | --- |
-| `/start` | Inicia o bot e exibe uma mensagem de boas-vindas. |
-| `ligar computador` | Envia o Wake-On-Lan e acende o LED manualmente. |
-| `desligar computador` | Envia o comando de desligamento via UDP para o PC. |
-| `ligar led` | Acende o LED (Ativa o Modo Manual, parando o rastreio automático). |
-| `desligar led` | Apaga o LED (Ativa o Modo Manual, parando o rastreio automático). |
-
-## Dependências da ESP32
-
-* [UniversalTelegramBot](https://github.com/witnessmenow/Universal-Arduino-Telegram-Bot)
-* [ArduinoJson](https://arduinojson.org/)
+* O agente de controle (`escuta.py`) foi desenvolvido apenas para ambiente Windows.
+* O sistema CSI detecta **movimento**, não presença estática (pessoas imóveis geram pouca alteração no sinal).
+* O painel web roda na rede local sem autenticação.
+* Se o script Python do radar reiniciar no PC, o alarme volta ao estado padrão (desarmado).
