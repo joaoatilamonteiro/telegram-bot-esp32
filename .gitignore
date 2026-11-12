@@ -1,7 +1,7 @@
 .env
 
-src/.venv/
-venv/
+*log_radar.txt
+*.venv/
 
 .vscode/
 .idea/
