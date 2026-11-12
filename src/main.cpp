@@ -71,15 +71,17 @@ void gerencia_mensagem(int numero_mensagens){
       bot.sendMessage(chatID, hello_world, "");
     }
 
-    else if (texto.indexOf("ativar radar") != -1){
+    else if (texto.indexOf("desativar") != -1 && texto.indexOf("radar") != -1){
+      bot.sendMessage(chatID, "🛌 Radar DESARMADO. Sistema em modo silencioso.", "");
+      Serial.println("[CMD:ALARME_OFF]"); // O Python vai ler isso
+    }
+
+
+    else if (texto.indexOf("ativar") != -1 && texto.indexOf("radar") != -1){
       bot.sendMessage(chatID, "🛡️ Radar ARMADO! Avisarei sobre movimentos.", "");
       Serial.println("[CMD:ALARME_ON]"); // O Python vai ler isso
     }
 
-    else if (texto.indexOf("desativar radar") != -1){
-      bot.sendMessage(chatID, "🛌 Radar DESARMADO. Sistema em modo silencioso.", "");
-      Serial.println("[CMD:ALARME_OFF]"); // O Python vai ler isso
-    }
 
     else if (texto.indexOf("status") != -1){
           // Se a ESP32 tem um IP salvo, é porque a porta 5000 está viva
@@ -88,6 +90,7 @@ void gerencia_mensagem(int numero_mensagens){
           } else {
             bot.sendMessage(chatID, "Sem resposta do computador", "");
           }
+          Serial.println("[CMD:STATUS_RADAR]");
     }
 
 
