@@ -4,11 +4,10 @@
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
 #include <WiFiUdp.h>
+#include <time.h>
 #include "secrets.h" 
-#include <ESP32Ping.h>
-
-extern void csiSetup();
-extern void csiLoop();
+#include "radar_api.h"
+#include "painel_web.h"
 
 WiFiClientSecure client;
 WiFiClient tcpClient;
@@ -22,6 +21,81 @@ const int pino_led = 2;
 
 unsigned long tuv = 0; 
 const unsigned long intervalo_varredura = 5000;
+
+// Ultimo aviso do radar enviado ao Telegram (epoch via NTP; 0 = hora indisponivel no envio).
+bool alerta_ja_enviado = false;
+time_t ultimo_alerta_epoch = 0;
+
+bool hora_valida() {
+  return time(nullptr) > 1700000000;
+}
+
+String formata_hora(time_t t) {
+  struct tm info;
+  localtime_r(&t, &info);
+  char buf[12];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &info);
+  return String(buf);
+}
+
+String link_painel() {
+  return "http://" + WiFi.localIP().toString() + "/";
+}
+
+String texto_ultimo_alerta() {
+  if (!alerta_ja_enviado) return "nenhum";
+  if (ultimo_alerta_epoch == 0) return "enviado (hora indisponível)";
+  return formata_hora(ultimo_alerta_epoch);
+}
+
+String monta_status_radar() {
+  EstadoRadar s;
+  radarCopiaEstado(s);
+
+  String situacao;
+  if (s.fase != RADAR_FASE_AO_VIVO) {
+    situacao = "⏳ Calibrando... " + String((int)(s.prog * 100)) + "% (mantenha o ambiente parado)";
+  } else if (s.alerta) {
+    situacao = "🔴 Movimento detectado agora";
+  } else {
+    situacao = "🟢 Sem movimento";
+  }
+
+  String msg = "📡 Radar\n";
+  msg += "Estado: " + String(s.armado ? "🛡️ ARMADO" : "🛌 DESARMADO") + "\n";
+  msg += "Situação: " + situacao + "\n";
+  msg += "Pacotes/s: " + String(s.pps) + "\n";
+  msg += "Último alerta enviado: " + texto_ultimo_alerta() + "\n";
+  msg += "Painel: " + link_painel();
+  if (s.fase == RADAR_FASE_AO_VIVO && s.pps < 30) {
+    msg += "\n⚠️ Poucos pacotes por segundo: a leitura pode estar pouco confiável.";
+  }
+  return msg;
+}
+
+void envia_alerta(uint16_t extras) {
+  String proxima;
+  if (hora_valida()) {
+    proxima = formata_hora(time(nullptr) + RADAR_COOLDOWN_S);
+  } else {
+    proxima = "em " + String(RADAR_COOLDOWN_S / 60) + " min";
+  }
+
+  String msg = "🚨 *ALERTA DE MOVIMENTO DETECTADO!* 🚨\n\n";
+  msg += "O radar interceptou atividade na área.\n";
+  if (extras > 0) {
+    msg += "📊 *Atividade no cooldown:* " + String(extras) + " novo(s) pico(s) registrado(s).\n";
+  }
+  msg += "⏳ *Próximo alerta liberado após:* " + proxima + "\n\n";
+  msg += "Acompanhe os gráficos ao vivo no painel:\n" + link_painel();
+
+  if (bot.sendMessage(chatID, msg, "Markdown")) {
+    alerta_ja_enviado = true;
+    ultimo_alerta_epoch = hora_valida() ? time(nullptr) : 0;
+  } else {
+    Serial.println("Falha ao enviar o alerta do radar ao Telegram");
+  }
+}
 
 void liga_pc_wol(){
     byte packet_magic[102];
@@ -67,19 +141,31 @@ void gerencia_mensagem(int numero_mensagens){
       hello_world += "🔍 status\n";
       hello_world += "🛡️ ativar radar\n";
       hello_world += "🛌 desativar radar\n";
+      hello_world += "🔄 recalibrar radar\n";
 
       bot.sendMessage(chatID, hello_world, "");
     }
 
+    else if (texto.indexOf("recalibrar") != -1){
+      radarPedeRecalibracao();
+      bot.sendMessage(chatID, "🔄 Recalibrando o radar por 60 segundos. Mantenha a área parada.", "");
+    }
+
     else if (texto.indexOf("desativar") != -1 && texto.indexOf("radar") != -1){
+      radarDefineArmado(false);
       bot.sendMessage(chatID, "🛌 Radar DESARMADO. Sistema em modo silencioso.", "");
-      Serial.println("[CMD:ALARME_OFF]"); // O Python vai ler isso
     }
 
 
     else if (texto.indexOf("ativar") != -1 && texto.indexOf("radar") != -1){
-      bot.sendMessage(chatID, "🛡️ Radar ARMADO! Avisarei sobre movimentos.", "");
-      Serial.println("[CMD:ALARME_ON]"); // O Python vai ler isso
+      radarDefineArmado(true);
+      String resposta = "🛡️ Radar ARMADO! Avisarei sobre movimentos.";
+      EstadoRadar s;
+      radarCopiaEstado(s);
+      if (s.fase != RADAR_FASE_AO_VIVO) {
+        resposta += "\n⏳ O radar ainda está calibrando; os alertas começam quando terminar.";
+      }
+      bot.sendMessage(chatID, resposta, "");
     }
 
 
@@ -90,7 +176,7 @@ void gerencia_mensagem(int numero_mensagens){
           } else {
             bot.sendMessage(chatID, "Sem resposta do computador", "");
           }
-          Serial.println("[CMD:STATUS_RADAR]");
+          bot.sendMessage(chatID, monta_status_radar(), "");
     }
 
 
@@ -213,7 +299,7 @@ void setup() {
   pinMode(pino_led, OUTPUT);
   digitalWrite(pino_led, LOW);
 
-  Serial.begin(921600);
+  Serial.begin(115200);
   while (!Serial) {
     delay(10);
   }
@@ -236,20 +322,32 @@ void setup() {
   client.setInsecure();
   ultimo_momento_visto = millis();
 
+  // Hora de Fortaleza (UTC-3, sem horario de verao) para as mensagens do Telegram
+  configTzTime("<-03>3", "pool.ntp.org", "time.google.com");
+
   csiSetup();
   // tarefa isolada para o nucleo 0
   xTaskCreatePinnedToCore(
     tarefaRadar,
     "TaskRadar",
-    10000,
+    12288,
     NULL,
     1,
     NULL,
     0
   );
+
+  painelSetup();
+  Serial.println("Painel do radar: " + link_painel());
 }
 
 void loop() {
+  // Aviso do radar pendente (a task do radar so sinaliza; quem fala com o Telegram e este loop)
+  uint16_t extras = 0;
+  if (radarConsomeAlerta(extras)) {
+    envia_alerta(extras);
+  }
+
   if (millis() - tuv > intervalo_varredura) {
     tuv = millis();
     
