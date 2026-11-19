@@ -2,6 +2,8 @@
 
 Este projeto transforma um ESP32 em um assistente residencial controlado via Telegram. Ele atua como ponte para controlar o seu computador pela rede local e, ao mesmo tempo, funciona como um **radar de movimento invisível**: usa a distorção do sinal Wi-Fi (CSI, Channel State Information) para detectar movimento no ambiente e enviar alertas.
 
+O radar roda **inteiro no ESP32**: captura, calibração, classificação, alertas e painel web. Não é preciso computador ligado nem Raspberry Pi para o radar funcionar.
+
 ## Funcionalidades
 
 **Controle do computador (PC)**
@@ -12,9 +14,10 @@ Este projeto transforma um ESP32 em um assistente residencial controlado via Tel
 **Radar CSI (detecção de movimento por Wi-Fi)**
 
 * `ativar radar` e `desativar radar`: armam e desarmam os alertas pelo Telegram.
-* `status`: informa se o PC está online (com o IP) e, quando o painel Python está rodando, o estado do radar: armado ou desarmado, situação (calibrando, sem movimento ou movimento), pacotes por segundo e horário do último alerta.
-* **Sem câmeras:** o ESP32 mede o CSI de cada pacote Wi-Fi recebido no núcleo 0 e envia os dados pela serial.
-* **Painel web ao vivo:** interface local em Python (FastAPI) com a situação atual, o gráfico do valor medido e do limiar e a contagem de pacotes por segundo.
+* `recalibrar radar`: refaz a calibração de 60 segundos (útil quando o ambiente mudou, por exemplo móveis de lugar).
+* `status`: informa se o PC está online (com o IP) e o estado do radar: armado ou desarmado, situação (calibrando, sem movimento ou movimento), pacotes por segundo, horário do último alerta e o link do painel.
+* **Sem câmeras:** o ESP32 mede o CSI de cada resposta do roteador no núcleo 0 e decide sozinho, com uma árvore de decisão embutida no firmware.
+* **Painel web ao vivo (servido pelo próprio ESP32):** situação atual, probabilidade de movimento e limiar, as características usadas pela árvore (`osc_p90` e `energia`), a oscilação de cada subportadora, o caminho percorrido na árvore e diagnósticos (pacotes por segundo, memória livre).
 * **Alertas com cooldown:** notificações no Telegram com intervalo de silêncio (padrão de 5 min) e contagem dos picos registrados nesse intervalo.
 
 ---
@@ -26,28 +29,33 @@ telegram_bot/
 ├── platformio.ini              Configuração do PlatformIO
 ├── README.md
 ├── src/
-│   ├── main.cpp                Firmware: bot do Telegram, Wake-on-LAN e tarefa do radar
-│   ├── csi_radar.cpp           Firmware: captura do CSI e tráfego de ping para o roteador
+│   ├── main.cpp                Bot do Telegram, Wake-on-LAN, alertas e criação das tarefas
+│   ├── csi_radar.cpp           Radar (núcleo 0): captura do CSI, tráfego ICMP, calibração, decisão
+│   ├── radar_features.h        Calibração e características do CSI (osc_p90 e energia)
+│   ├── radar_decisao.h         Árvore embutida, regra de alerta (4 de 10) e cooldown
+│   ├── radar_api.h             Estado compartilhado entre o radar (núcleo 0) e o resto (núcleo 1)
+│   ├── painel_web.h / .cpp     Painel web servido pelo ESP32
+│   ├── modelo_arvore.h         Árvore treinada convertida para C++ (GERADO, não editar à mão)
 │   └── secrets.h               Credenciais (ignorado pelo git)
 └── python/
-│   ├── escuta.py               Agente do PC (Windows): responde à busca e executa o desligamento
-    ├── demo_ao_vivo_web.py     Painel do radar: serial, detecção, painel web e Telegram
-    ├── csi_features.py         Calibração e características do CSI
+    ├── escuta.py               Agente do PC (Windows): responde à busca e executa o desligamento
+    ├── csi_features.py         Calibração e características (referência do treino)
     ├── modelo_arvore.joblib    Árvore de decisão treinada (movimento / sem movimento)
-    ├── requirements.txt        Dependências Python
-    ├── log_radar.txt           Log de diagnóstico, gerado ao rodar (ignorado pelo git)
-    └── __pycache__/            Cache do Python (ignorado pelo git)
+    ├── exportar_modelo_h.py    Converte o .joblib em src/modelo_arvore.h
+    ├── demo_ao_vivo_web.py     LEGADO: painel em Python, só funciona com o firmware antigo (CSV pela serial)
+    └── requirements.txt        Dependências Python
 ```
 
 ---
 
 ## Como o radar funciona
 
-1. O PC dispara um pacote UDP para o ESP32 a cada 20 ms (cerca de 50 por segundo) na porta 5555. Esse tráfego existe apenas para gerar pacotes que o ESP32 receba e meça.
-2. Para cada pacote recebido, o ESP32 imprime na serial (921600 baud) uma linha CSV com o timestamp, o RSSI, o tamanho e os 384 valores do CSI.
-3. O script Python lê a serial e calibra durante **60 segundos**, com o ambiente parado, para aprender como o ambiente fica sem movimento.
-4. Depois da calibração, cada janela de 1 segundo (avaliada a cada 0,5 s e com pelo menos 20 pacotes) vira um valor. Com o modelo `.joblib`, esse valor é a probabilidade de movimento e o limiar padrão é 0,5.
-5. O alerta é ativado quando pelo menos 4 das últimas 10 janelas passam do limiar. Ele só é enviado ao Telegram se o radar estiver armado e fora do cooldown.
+1. O ESP32 envia um **ping ICMP ao roteador** a cada 20 ms. As respostas são pacotes recebidos, e é neles que o CSI é medido (cerca de 40 a 50 por segundo).
+2. O callback do CSI copia as 64 subportadoras (LLTF) de cada pacote para uma fila circular. A task do radar (núcleo 0) converte em amplitudes.
+3. Nos primeiros **60 segundos**, com o ambiente parado, o radar aprende o "normal": quais subportadoras são úteis (máscara, definida nos 5 primeiros segundos) e a oscilação típica de cada uma. Se chegarem pacotes de menos, a calibração recomeça.
+4. Depois, a cada 0,5 s ele avalia a janela do último 1 s (mínimo de 20 pacotes) e calcula `osc_p90` e `energia`.
+5. A **árvore de decisão** embutida (`modelo_arvore.h`) transforma as duas características em uma probabilidade de movimento. O limiar é 0,5.
+6. O alerta é ativado quando pelo menos 4 das últimas 10 janelas passam do limiar. Ele só vai ao Telegram se o radar estiver armado e fora do cooldown. Quem envia a mensagem é o `loop()` do núcleo 1, nunca a task do radar.
 
 ---
 
@@ -82,63 +90,51 @@ pio run -t upload
 
 Notas:
 
-* A comunicação serial roda a **921600 baud**.
+* A comunicação serial roda a **115200 baud**.
 * O ESP32 só usa a banda de 2.4 GHz. A rede configurada precisa oferecê-la.
 * A rede precisa aceitar WPA/WPA2 pessoal. Redes corporativas (WPA2 Enterprise) e com portal de login não são suportadas.
+* O roteador precisa **responder a ping** (ICMP). É isso que gera os pacotes do radar.
 * Para ligar o PC remotamente, o Wake-on-LAN precisa estar habilitado na BIOS e na placa de rede.
 
-### 2. Configuração no PC (Windows)
+### 2. Agente do PC (Windows) — só para ligar/desligar o computador
 
-Crie e ative um ambiente virtual e instale as dependências do painel do radar:
+O radar não depende dele. Só o controle do PC precisa do `escuta.py`:
 
 ```powershell
 python -m venv python\.venv
 python\.venv\Scripts\activate
-pip install -r python\requirements.txt
-```
-
-**Controle do PC (`escuta.py`):** além das dependências acima, o agente usa o `getmac`. Instale e inicie (libere a porta UDP/TCP 5000 no firewall do Windows):
-
-```powershell
 pip install getmac
-python src/escuta.py
+python python/escuta.py
 ```
 
-**Painel do radar:** o ESP32 precisa estar conectado ao PC por USB.
+Libere a porta UDP/TCP 5000 no firewall do Windows.
 
 ---
 
 ## Usando o radar
 
-1. Alimente o ESP32 por USB e aguarde cerca de 10 segundos para ele conectar ao Wi-Fi.
-2. Feche qualquer monitor serial (PlatformIO, Arduino IDE). Só um programa pode usar a porta COM por vez.
-3. Na raiz do projeto, inicie o painel. O IP do ESP32 é detectado automaticamente, então não é preciso informá-lo:
+1. Alimente o ESP32 e abra o monitor serial (`pio device monitor`). Quando o Wi-Fi conectar, ele mostra `Painel do radar: http://<IP>/`.
+2. Abra esse endereço no navegador do PC ou do celular, na mesma rede.
+3. Mantenha a área **parada por 60 segundos** até aparecer "SEM MOVIMENTO". Na serial você vê `Mascara definida`, `Calibracao concluida` e uma linha `janela:` a cada 0,5 s.
+4. No Telegram, envie `ativar radar` para armar os alertas.
+
+Valores de referência (parado): `osc_p90` em torno de 1,1 a 1,2 e `energia` perto de 1. Com alguém se movendo, `osc_p90` passa de 1,4. Por ser um percentil 90, o `osc_p90` fica um pouco acima de 1 mesmo sem movimento.
+
+---
+
+## Atualizando o modelo
+
+O treino continua no PC. A ESP32 só executa a árvore.
+
+1. Treine a árvore e salve o `.joblib` (dicionário com `modelo`, `features` e `versao`), usando **apenas** as características `osc_p90` e `energia`, que são as que o firmware calcula.
+2. Converta para C++ (precisa de `numpy`, `scikit-learn` e `joblib`):
 
    ```powershell
-   python python/demo_ao_vivo_web.py --serial COM5 --modelo python/modelo_arvore.joblib
+   python python/exportar_modelo_h.py
    ```
 
-   O terminal deve mostrar `[serial] COM5 aberta` e `[udp] disparando para <IP>`. Esse é o IP detectado do ESP32.
-
-4. Se a linha `[udp] disparando` não aparecer, o IP não foi detectado. O firmware imprime o IP uma única vez, ao ligar. Reinicie o ESP32 (botão EN) com o script rodando, ou informe o IP manualmente com `--ip <IP_DO_ESP32>`.
-5. Confira que o PC alcança o ESP32 com `ping <IP>`, usando o IP mostrado no terminal.
-6. Abra `http://localhost:8000` no PC, ou `http://<IP_DO_PC>:8000` no celular na mesma rede.
-7. Mantenha o ambiente **parado por 60 segundos** até aparecer "SEM MOVIMENTO".
-8. No Telegram, envie `ativar radar` para armar os alertas.
-
-### Argumentos do painel
-
-| Argumento | Descrição |
-|---|---|
-| `--serial` | Porta COM do ESP32. Se omitido, o script tenta detectar uma única porta USB. |
-| `--ip` | Opcional. Se omitido, o script detecta o IP do ESP32 pela serial. Se informado e a ESP reportar outro IP, o da ESP prevalece e o script avisa. |
-| `--token` | Token do bot. Se omitido, é lido de `src/secrets.h`. |
-| `--chat-id` | Seu Chat ID. Se omitido, é lido de `src/secrets.h`. |
-| `--link` | Link do painel enviado nas mensagens. Padrão: `http://<IP_DO_PC>:8000`. |
-| `--cooldown` | Segundos de silêncio do Telegram após um alerta. Padrão: 300. |
-| `--modelo` | Arquivo `.joblib` com a árvore treinada. Sem ele, o limiar é calculado a partir da calibração. |
-
-O firmware imprime o IP do ESP32 na serial uma única vez, ao ligar. Se o script já estiver rodando quando a placa conectar, ou se a placa reiniciar ao abrir a porta serial, o IP é detectado sozinho. Caso contrário, reinicie o ESP32 com o script aberto ou use `--ip`.
+   O script valida a conversão contra o scikit-learn e aborta se divergir ou se a árvore usar outra característica.
+3. Regrave o firmware: `pio run -t upload`.
 
 ---
 
@@ -152,6 +148,7 @@ O firmware imprime o IP do ESP32 na serial uma única vez, ao ligar. Se o script
 | `status` | Informa o estado do PC e do radar. |
 | `ativar radar` | Arma os alertas de movimento. |
 | `desativar radar` | Desarma os alertas. |
+| `recalibrar radar` | Refaz a calibração de 60 s. |
 
 Somente o chat configurado em `chatID` é atendido. Outros usuários recebem "Acesso negado".
 
@@ -161,17 +158,14 @@ Somente o chat configurado em `chatID` é atendido. Outros usuários recebem "Ac
 
 | Sintoma | Causa provável e o que fazer |
 |---|---|
-| A calibração sobe até 100% e volta a 0% | Chegam menos de 20 pacotes por segundo. O terminal mostra `[calib] FALHOU`. Confira o `ping` para o ESP32, se PC e ESP32 estão na mesma rede, se o roteador não isola clientes e se o `--ip` está correto. |
-| Fica em "Calibrando 0%" | Nenhuma linha válida chega da serial. Procure `[serial] nao consegui abrir`: feche monitores seriais e confira o `--serial` e o cabo. |
-| O log mostra `UDP NAO iniciado` | O IP do ESP32 não foi detectado. Reinicie o ESP32 com o script aberto ou informe `--ip`. |
-| Aviso `timestamp voltou no tempo` | O ESP32 reiniciou, por falta de energia no USB ou cabo ruim. A calibração recomeça. |
-| Pacotes por segundo baixos ou instáveis | Interferência no 2.4 GHz, sinal fraco, VPN ou adaptadores virtuais (WSL, Docker) mudando a rota do PC. No PowerShell, `Find-NetRoute -RemoteIPAddress <IP_DO_ESP32>` mostra por qual interface o PC fala com a placa. |
-| O painel fica em "Carregando..." | O navegador não alcança o servidor ou não tem internet para carregar o Chart.js. |
+| A calibração sobe até 100% e volta a 0% | Chegam menos de 20 pacotes por janela. A serial mostra `Calibracao FALHOU`. Confira se o roteador responde a ping e a linha `pps=` na serial. |
+| `pps` perto de 10 | O roteador não está respondendo ao ping e só chegam os beacons. Teste outro roteador ou reduza filtros de ICMP. |
+| `pps` baixo ou instável | Interferência no 2.4 GHz ou sinal fraco. Aproxime o ESP32 do roteador. |
+| `ERRO: sessao de ping falhou` | O ESP32 não obteve o gateway. Verifique o Wi-Fi; o radar tenta de novo a cada 2 s. |
+| O painel mostra "Sem resposta da ESP32..." | O navegador não alcança o IP da placa (outra rede, ou isolamento de clientes no roteador). |
+| `parado` e `movendo` aparecem na mesma faixa de valores | O tráfego (respostas do roteador) pode ter características diferentes do usado no treino. Recoletar dados com esse tráfego e reexportar a árvore. |
 | O bot não responde | Confira `BOT_TOKEN` e `chatID` no `secrets.h`. |
-
-### Log de diagnóstico
-
-O painel grava `python/log_radar.txt` a cada 2 segundos, em todas as fases, com a fase atual, o progresso da calibração, os pacotes por segundo reais, o IP alvo do UDP e o número de falhas de calibração. Quando algo está errado, a linha inclui uma dica. O arquivo está no `.gitignore`.
+| O alerta demora a chegar | O `loop()` pode estar ocupado (por exemplo, no protocolo de desligamento, que dura cerca de 1 minuto). O aviso sai assim que ele terminar. |
 
 ---
 
@@ -179,9 +173,11 @@ O painel grava `python/log_radar.txt` a cada 2 segundos, em todas as fases, com 
 
 * O agente de controle (`escuta.py`) foi desenvolvido apenas para Windows.
 * O sistema CSI detecta **movimento**, não presença estática. Pessoas imóveis geram pouca alteração no sinal.
-* O painel web roda na rede local sem autenticação.
-* Se o script Python do radar reiniciar, o alarme volta ao estado padrão (desarmado).
-* O radar depende do tráfego entre o PC e o ESP32. Redes com isolamento de clientes, firewall entre as máquinas ou proteção contra flood de UDP podem impedir a calibração.
-* O gráfico do painel carrega o Chart.js de um CDN e precisa de internet no navegador.
+* O painel web roda na rede local sem autenticação. Ele só exibe dados; armar, desarmar e recalibrar são feitos só pelo Telegram.
+* O alarme volta a **desarmado** quando o ESP32 reinicia.
+* A calibração é refeita a cada reinício (60 s) e não é salva.
+* O radar depende de o roteador responder a ping. Roteadores que bloqueiam ICMP impedem a captura.
+* A hora das mensagens vem de NTP (fuso fixo UTC-3). Sem internet, as mensagens trazem "em 5 min" no lugar do horário.
 * As credenciais do Wi-Fi ficam no firmware (`secrets.h`). Para trocar de rede é preciso recompilar e gravar a placa.
-* O limiar de sensibilidade é fixo (0,5 com o modelo). Para mudar, é preciso alterar o código.
+* O limiar de sensibilidade é fixo (0,5). Para mudar, é preciso alterar `LIMIAR_PROB` em `radar_decisao.h`.
+* `demo_ao_vivo_web.py` não funciona com este firmware, porque o ESP32 não envia mais o CSV pela serial. Foi mantido só como referência.
