@@ -1,44 +1,36 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include "esp_wifi.h"
+#include "ping/ping_sock.h"
+#include "lwip/ip_addr.h"
 
 
-static WiFiUDP csiUdp;
+static const uint32_t INTERVALO_PING_MS = 20;
 
-static unsigned long ultimo_ping_csi = 0;
-// 20 ms = ~50 pacotes/s.
-static const unsigned long intervalo_ping_csi = 20; 
-
-static const int TAMANHO_CSI = 128;
-static const int FILA_TAM = 64;
+static const int TAMANHO_CSI = 128;        
+static const int FILA_TAM = 64;           
 static const int FILA_MASCARA = FILA_TAM - 1;
 
-struct AmostraCsi
-{
+struct AmostraCsi {
   uint32_t timestamp;
   int8_t rssi;
   int8_t raw[TAMANHO_CSI];
-  /* data */
 };
 
 static AmostraCsi fila[FILA_TAM];
-static volatile uint16_t cabeca = 0;
-static volatile uint16_t cauda = 0;      // próxima posição a ler (csiLoop)
-static volatile uint32_t descartes = 0;  // pacotes perdidos por fila cheia
+static volatile uint16_t cabeca = 0;       
+static volatile uint16_t cauda = 0;        
+static volatile uint32_t descartes = 0;    
 
 static portMUX_TYPE csiMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Linha de saida: ate 10 digitos + rssi + tamanho + 384 valores de ate 5 chars + \n
-static char linhaBuf[2400];
-
 static void csiCallback(void *ctx, wifi_csi_info_t *info) {
   if (!info || !info->buf) return;
-  if (info->len < TAMANHO_CSI) return;   // só aceita pacote com LLTF completo
+  if ((int)info->len < TAMANHO_CSI) return;   
 
   portENTER_CRITICAL(&csiMux);
   if ((uint16_t)(cabeca - cauda) >= FILA_TAM) {
-    descartes = descartes + 1;           // fila cheia: descarta o pacote novo
+    descartes = descartes + 1;               
   } else {
     AmostraCsi &a = fila[cabeca & FILA_MASCARA];
     memcpy(a.raw, info->buf, TAMANHO_CSI);
@@ -49,26 +41,36 @@ static void csiCallback(void *ctx, wifi_csi_info_t *info) {
   portEXIT_CRITICAL(&csiMux);
 }
 
-// Escreve um inteiro em texto no destino e devolve quantos chars escreveu.
-static int escreveInt(char *dst, long v) {
-  char tmp[12];
-  int n = 0;
-  bool neg = v < 0;
-  unsigned long u = neg ? (unsigned long)(-v) : (unsigned long)v;
+static void iniciaPingGateway() {
+  IPAddress gw = WiFi.gatewayIP();
+  if (gw[0] == 0) {
+    Serial.println("ERRO: sem gateway, ping nao iniciado");
+    return;
+  }
 
-  do {
-    tmp[n++] = (char)('0' + (u % 10));
-    u /= 10;
-  } while (u > 0);
+  ip_addr_t alvo;
+  IP_ADDR4(&alvo, gw[0], gw[1], gw[2], gw[3]);
 
-  int pos = 0;
-  if (neg) dst[pos++] = '-';
-  while (n > 0) dst[pos++] = tmp[--n];
-  return pos;
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  cfg.target_addr = alvo;
+  cfg.count = ESP_PING_COUNT_INFINITE;
+  cfg.interval_ms = INTERVALO_PING_MS;
+  cfg.timeout_ms = 500;
+  cfg.data_size = 8;
+
+  esp_ping_callbacks_t cbs = {};
+  esp_ping_handle_t handle = NULL;
+  if (esp_ping_new_session(&cfg, &cbs, &handle) != ESP_OK ||
+      esp_ping_start_session(handle) != ESP_OK) {
+    Serial.println("ERRO: sessao de ping falhou");
+    return;
+  }
+
+  Serial.print("Ping ICMP iniciado para o gateway ");
+  Serial.println(gw);
 }
 
 void csiSetup() {
-  // Desliga a economia de energia do WiFi: com modem sleep a recepcao fica irregular.
   WiFi.setSleep(false);
 
   wifi_csi_config_t csiConfig = {
@@ -91,21 +93,12 @@ void csiSetup() {
     Serial.println("ERRO: esp_wifi_set_csi falhou");
   }
 
+  iniciaPingGateway();
   Serial.println("CSI ativado");
-  Serial.println("timestamp_ms,rssi,tamanho,csi_raw");
 }
 
 void csiLoop() {
   unsigned long agora = millis();
-
-  if (agora - ultimo_ping_csi >= intervalo_ping_csi) {
-    ultimo_ping_csi = agora;
-    csiUdp.beginPacket(WiFi.gatewayIP(), 9); // pinga o roteador so pra gerar trafego
-    csiUdp.write((uint8_t)0);
-    csiUdp.endPacket();
-  }
-
-  // TEMPORÁRIO: só drena a fila e conta pacotes por segundo
   static uint32_t contados = 0;
   static unsigned long t0 = 0;
 
